@@ -1,0 +1,520 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Night Flight — Face Dodger</title>
+<style>
+  :root{--bg1:#040617;--bg2:#0b1226;--accent:#4FA9FF;--muted:#9fd8ff}
+  html,body{height:100%;margin:0;background:var(--bg1);color:#eaf6ff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
+  canvas{display:block;width:100vw;height:100vh;touch-action:none}
+  .ui {
+    position: fixed; left: 12px; top: 12px; z-index: 40; display:flex; gap:8px; align-items:center;
+  }
+  .ui button {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.06);
+    color: var(--muted);
+    padding: 8px 10px;
+    border-radius: 10px;
+    font-weight:700;
+    cursor:pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .score {
+    position: fixed; left:50%; transform: translateX(-50%); top: 14px; z-index: 40;
+    font-weight:800; font-size:20px; color:var(--muted); text-shadow: 0 2px 6px rgba(0,0,0,0.6);
+    background: rgba(255,255,255,0.02); padding:6px 12px; border-radius:12px;
+  }
+  .overlay {
+    position: fixed; inset:0; display:flex; align-items:center; justify-content:center; z-index:50;
+    pointer-events:none;
+  }
+  .panel {
+    pointer-events:auto;
+    background: linear-gradient(180deg, rgba(2,6,12,0.9), rgba(6,10,20,0.95));
+    padding:18px 22px; border-radius:14px; text-align:center; box-shadow: 0 10px 40px rgba(0,0,0,0.6);
+  }
+  .panel h2 { margin:0 0 8px; font-size:22px; color:#dff6ff }
+  .panel p { margin:0 0 12px; color:#cfeeff; font-size:14px; line-height:1.3 }
+  .panel button {
+    background: var(--accent); color:#071023; border:none; padding:10px 16px; border-radius:10px; font-weight:800;
+  }
+  @media (min-width:720px){
+    .score{font-size:22px}
+  }
+</style>
+</head>
+<body>
+
+<canvas id="c"></canvas>
+
+<div class="ui">
+  <button id="btnPause">Pause</button>
+  <button id="btnMute">🔊</button>
+</div>
+
+<div class="score" id="scoreDisplay">0</div>
+
+<div class="overlay" id="startOverlay">
+  <div class="panel">
+    <h2>Night Flight</h2>
+    <p>Tap / hold to rise. Release to descend. Dodge glowing towers — the longer you fly, the higher your score.</p>
+    <button id="btnStart">Play</button>
+  </div>
+</div>
+
+<div class="overlay" id="gameOverOverlay" style="display:none">
+  <div class="panel">
+    <h2>Game Over</h2>
+    <p id="finalScoreText">Score: 0</p>
+    <button id="btnRestart">Restart</button>
+  </div>
+</div>
+
+<script>
+(() => {
+  // Canvas setup
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  let DPR = Math.max(1, window.devicePixelRatio || 1);
+  function resize() {
+    DPR = Math.max(1, window.devicePixelRatio || 1);
+    canvas.width = Math.floor(innerWidth * DPR);
+    canvas.height = Math.floor(innerHeight * DPR);
+    canvas.style.width = innerWidth + 'px';
+    canvas.style.height = innerHeight + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  addEventListener('resize', resize);
+  resize();
+
+  // UI elements
+  const startOverlay = document.getElementById('startOverlay');
+  const gameOverOverlay = document.getElementById('gameOverOverlay');
+  const btnStart = document.getElementById('btnStart');
+  const btnRestart = document.getElementById('btnRestart');
+  const btnPause = document.getElementById('btnPause');
+  const btnMute = document.getElementById('btnMute');
+  const scoreDisplay = document.getElementById('scoreDisplay');
+  const finalScoreText = document.getElementById('finalScoreText');
+
+  // Game variables
+  let running = false;
+  let paused = false;
+  let muted = false;
+  let lastTime = 0;
+  let raf = null;
+  let score = 0;
+
+  // World
+  const world = {
+    scrollX: 0,
+    speed: 160, // px per second
+    bgSpeed: 18,
+    midSpeed: 40
+  };
+
+  // Player (uses your face image; kept upright)
+  const plane = {
+    x: 120, // fixed screen x
+    y: innerHeight / 2,
+    w: 64,   // size of face sprite (square)
+    h: 64,
+    vy: 0,
+    gravity: 1400,
+    thrust: -600,
+    maxUp: -700,
+    trailTimer: 0
+  };
+
+  // Load face image
+  const planeImg = new Image();
+  planeImg.src = 'face.png'; // put your face.png in same folder
+  let planeImgLoaded = false;
+  planeImg.onload = () => { planeImgLoaded = true; };
+
+  // Obstacles (towers)
+  const obstacles = [];
+  const gapMin = 150;
+  const gapMax = 240;
+  const spawnDistance = 420; // horizontal distance between spawns
+  let nextSpawnX = innerWidth + 200;
+
+  // Parallax background layers
+  const stars = []; // small points
+  const city = []; // silhouette rectangles
+  const clouds = []; // decorative
+
+  // Particles for trail
+  const particles = [];
+
+  // Sounds (tiny, optional)
+  let audioCtx = null;
+  function initAudio() {
+    if (audioCtx) return;
+    try {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    } catch (e) { audioCtx = null; }
+  }
+  function beep(freq, time = 0.06, vol = 0.05) {
+    if (muted || !audioCtx) return;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = 'sine';
+    o.frequency.value = freq;
+    g.gain.value = vol;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start();
+    o.stop(audioCtx.currentTime + time);
+  }
+
+  // Utility
+  function rand(a, b) { return a + Math.random() * (b - a); }
+
+  // Create background elements
+  function populateBackground() {
+    stars.length = 0;
+    for (let i=0;i<120;i++){
+      stars.push({x: rand(0, innerWidth), y: rand(0, innerHeight*0.6), r: Math.random()*1.6, alpha: rand(0.2,1)});
+    }
+    city.length = 0;
+    const cols = Math.ceil(innerWidth / 60) + 6;
+    for (let i=0;i<cols;i++){
+      const w = rand(40,120);
+      const h = rand(innerHeight*0.08, innerHeight*0.28);
+      city.push({x: i*60 + rand(-40,40), y: innerHeight - h - 40, w, h, color: `rgba(12,18,30,${rand(0.6,0.95)})`});
+    }
+    clouds.length = 0;
+    for (let i=0;i<8;i++){
+      clouds.push({x:rand(0, innerWidth*2), y:rand(40, innerHeight*0.45), w:rand(80,220), h:rand(30,70), speed: rand(6,22)});
+    }
+  }
+  populateBackground();
+
+  // Spawn obstacle (pair) at worldX
+  function spawnObstacle(worldX) {
+    const gap = rand(gapMin, gapMax);
+    const topH = rand(60, innerHeight*0.45 - gap/2);
+    const bottomY = topH + gap;
+    const towerW = rand(52, 92);
+    obstacles.push({
+      x: worldX,
+      w: towerW,
+      top: {y: 0, h: topH},
+      bottom: {y: bottomY, h: innerHeight - bottomY - 40}, // leave small ground margin
+      counted: false,
+      colorHue: 200 + Math.floor(rand(-20,20))
+    });
+  }
+
+  // Reset world
+  function resetWorld() {
+    world.scrollX = 0;
+    plane.y = innerHeight / 2;
+    plane.vy = 0;
+    obstacles.length = 0;
+    particles.length = 0;
+    score = 0;
+    nextSpawnX = innerWidth + 200;
+    populateBackground();
+    updateScore();
+  }
+
+  // Score display
+  function updateScore() {
+    scoreDisplay.textContent = Math.floor(score);
+  }
+
+  // Collision check between plane rect-ish and obstacle rectangles
+  function checkCollision() {
+    // plane bounding box (slightly smaller than sprite)
+    const px = plane.x - plane.w*0.4;
+    const py = plane.y - plane.h*0.5;
+    const pw = plane.w*0.8;
+    const ph = plane.h;
+
+    for (let ob of obstacles) {
+      const ox = ob.x - world.scrollX;
+      // top tower rect
+      const topRect = {x: ox, y: ob.top.y, w: ob.w, h: ob.top.h};
+      const botRect = {x: ox, y: ob.bottom.y, w: ob.w, h: ob.bottom.h};
+      if (rectIntersect(px,py,pw,ph, topRect.x, topRect.y, topRect.w, topRect.h) ||
+          rectIntersect(px,py,pw,ph, botRect.x, botRect.y, botRect.w, botRect.h)) {
+        return true;
+      }
+    }
+    // ground/ceiling
+    if (plane.y - plane.h*0.5 < 0 || plane.y + plane.h*0.5 > innerHeight - 20) return true;
+    return false;
+  }
+  function rectIntersect(ax,ay,aw,ah, bx,by,bw,bh){
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  }
+
+  // Particle emitter (trail)
+  function emitTrail() {
+    const p = {
+      x: plane.x - Math.max(22, plane.w*0.3),
+      y: plane.y + (rand(-6,6)),
+      vx: -rand(50,140),
+      vy: rand(-20,20),
+      r: rand(2,5),
+      life: rand(0.35,0.7),
+      t:0,
+      col: `rgba(100,220,255,${rand(0.12,0.45)})`
+    };
+    particles.push(p);
+  }
+
+  // Draw everything
+  function draw() {
+    // Clear with dark gradient
+    const g = ctx.createLinearGradient(0,0,0,innerHeight);
+    g.addColorStop(0, '#030617');
+    g.addColorStop(1, '#071326');
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,innerWidth,innerHeight);
+
+    // Stars (parallax)
+    ctx.save();
+    for (let s of stars) {
+      const sx = (s.x - world.scrollX*0.02) % (innerWidth + 200);
+      ctx.globalAlpha = s.alpha;
+      ctx.fillStyle = 'white';
+      ctx.beginPath();
+      ctx.arc(sx, s.y, s.r, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+
+    // clouds mid
+    for (let c of clouds) {
+      const cx = (c.x - world.scrollX*0.12) % (innerWidth*2);
+      ctx.fillStyle = `rgba(20,30,40,0.28)`;
+      ctx.beginPath();
+      ctx.ellipse(cx, c.y, c.w, c.h, 0, 0, Math.PI*2);
+      ctx.fill();
+    }
+
+    // city silhouette
+    for (let s of city) {
+      const sx = s.x - (world.scrollX * 0.08 % (innerWidth + 200));
+      ctx.fillStyle = s.color;
+      ctx.fillRect(sx, s.y, s.w, s.h);
+      // windows glow
+      ctx.fillStyle = 'rgba(80,160,255,0.04)';
+      for (let i=0;i<3;i++){
+        const wx = sx + (i*12) + 6;
+        ctx.fillRect(wx, s.y + 10, 6, 8);
+      }
+    }
+
+    // Obstacles (towers) with neon edges
+    for (let ob of obstacles) {
+      const ox = Math.round(ob.x - world.scrollX);
+      if (ox + ob.w < -100 || ox > innerWidth + 200) continue;
+      // top
+      ctx.fillStyle = `hsl(${ob.colorHue} 80% 35%)`;
+      ctx.fillRect(ox, ob.top.y, ob.w, ob.top.h);
+      // neon edge
+      ctx.strokeStyle = `hsla(${ob.colorHue},90%,70%,0.12)`;
+      ctx.lineWidth = 6;
+      ctx.strokeRect(ox-2, ob.top.y-2, ob.w+4, ob.top.h+4);
+      // bottom
+      ctx.fillStyle = `hsl(${ob.colorHue} 85% 28%)`;
+      ctx.fillRect(ox, ob.bottom.y, ob.w, ob.bottom.h);
+      ctx.strokeStyle = `hsla(${ob.colorHue},90%,70%,0.08)`;
+      ctx.lineWidth = 6;
+      ctx.strokeRect(ox-2, ob.bottom.y-2, ob.w+4, ob.bottom.h+4);
+    }
+
+    // Particles
+    for (let p of particles) {
+      ctx.globalAlpha = 1 - (p.t / p.life);
+      ctx.fillStyle = p.col;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Draw plane (upright face image). If image not loaded yet, draw a simple placeholder.
+    ctx.save();
+    ctx.translate(plane.x, plane.y);
+    if (planeImgLoaded) {
+      // keep upright (no rotation)
+      ctx.drawImage(planeImg, -plane.w/2, -plane.h/2, plane.w, plane.h);
+    } else {
+      // placeholder ellipse while image loading
+      ctx.fillStyle = '#9ff';
+      ctx.beginPath();
+      ctx.ellipse(0, 0, plane.w/2, plane.h/2, 0, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // HUD (score handled in DOM)
+  }
+
+  // Update loop
+  function update(ts) {
+    if (!running) return;
+    if (!lastTime) lastTime = ts;
+    const dt = Math.min(0.033, (ts - lastTime) / 1000);
+    lastTime = ts;
+
+    if (!paused) {
+      // advance world scroll
+      world.scrollX += world.speed * dt;
+
+      // plane physics
+      plane.vy += plane.gravity * dt;
+      plane.y += plane.vy * dt;
+
+      // clamp within reasonable bounds
+      plane.y = Math.max(20, Math.min(innerHeight - 20, plane.y));
+
+      // spawn obstacles as world scroll increases
+      if (world.scrollX + innerWidth > nextSpawnX) {
+        spawnObstacle(nextSpawnX);
+        nextSpawnX += spawnDistance + rand(-120, 120);
+      }
+
+      // update obstacles and scoring
+      for (let i = obstacles.length - 1; i >= 0; i--) {
+        const ob = obstacles[i];
+        const ox = ob.x - world.scrollX;
+        // mark passed for score
+        if (!ob.counted && ox + ob.w < plane.x) {
+          ob.counted = true;
+          score += 1;
+          updateScore();
+          beep(900, 0.04, 0.02);
+        }
+        // remove offscreen left
+        if (ox + ob.w < -200) obstacles.splice(i, 1);
+      }
+
+      // particles (trail)
+      plane.trailTimer += dt;
+      if (plane.trailTimer > 0.04) {
+        plane.trailTimer = 0;
+        emitTrail();
+      }
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.t += dt;
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        if (p.t >= p.life) particles.splice(i, 1);
+      }
+
+      // move clouds slowly
+      for (let c of clouds) c.x -= c.speed * dt;
+
+      // collision
+      if (checkCollision()) {
+        // crash
+        running = false;
+        gameOver();
+        beep(160, 0.15, 0.08);
+      }
+    }
+
+    draw();
+    raf = requestAnimationFrame(update);
+  }
+
+  // Input handling: tap/hold to thrust (rise)
+  let pointerDown = false;
+  function onPointerDown(e) {
+    e.preventDefault();
+    if (!audioCtx) initAudio();
+    pointerDown = true;
+    if (!running) return;
+    plane.vy = plane.thrust; // immediate lift
+  }
+  function onPointerUp(e) {
+    pointerDown = false;
+  }
+  canvas.addEventListener('pointerdown', onPointerDown, {passive:false});
+  addEventListener('pointerup', onPointerUp);
+
+  // Also handle continuous hold effect
+  function holdLoop() {
+    if (pointerDown && running && !paused) {
+      plane.vy += plane.thrust * 0.018; // gentle upward while holding (additive)
+      if (plane.vy < plane.maxUp) plane.vy = plane.maxUp;
+    }
+    requestAnimationFrame(holdLoop);
+  }
+
+  holdLoop();
+
+  // Start & Restart handlers
+  function startGame() {
+    initAudio();
+    resetWorld();
+    running = true;
+    paused = false;
+    lastTime = 0;
+    startOverlay.style.display = 'none';
+    gameOverOverlay.style.display = 'none';
+    updateScore();
+    raf = requestAnimationFrame(update);
+  }
+  function gameOver() {
+    finalScoreText.textContent = `Score: ${Math.floor(score)}`;
+    gameOverOverlay.style.display = '';
+  }
+  function restartGame() {
+    resetWorld();
+    running = true;
+    paused = false;
+    lastTime = 0;
+    gameOverOverlay.style.display = 'none';
+    raf = requestAnimationFrame(update);
+  }
+
+  // Pause / Mute buttons
+  btnPause.addEventListener('click', () => {
+    paused = !paused;
+    btnPause.textContent = paused ? 'Resume' : 'Pause';
+    if (!paused && running) {
+      lastTime = performance.now();
+      raf = requestAnimationFrame(update);
+    }
+  });
+  btnMute.addEventListener('click', () => {
+    muted = !muted;
+    btnMute.textContent = muted ? '🔇' : '🔊';
+  });
+
+  btnStart.addEventListener('click', startGame);
+  btnRestart.addEventListener('click', restartGame);
+
+  // Keyboard support (space to thrust)
+  addEventListener('keydown', (e) => {
+    if (e.code === 'Space') {
+      e.preventDefault();
+      pointerDown = true;
+      plane.vy = plane.thrust;
+    } else if (e.key.toLowerCase() === 'p') {
+      btnPause.click();
+    }
+  });
+  addEventListener('keyup', (e) => {
+    if (e.code === 'Space') pointerDown = false;
+  });
+
+  // Initialize world and start paused
+  resetWorld();
+  startOverlay.style.display = '';
+  scoreDisplay.textContent = '0';
+})();
+</script>
+</body>
+</html>
